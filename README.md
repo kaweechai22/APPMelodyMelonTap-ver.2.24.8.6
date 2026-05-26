@@ -98,15 +98,4 @@ Clean rebuild: ตัดโค้ดซ้ำ/โค้ดเก่า/เอฟ
 - มีโพรงมาก: hollowPercent >= 18
 - เพิ่มปุ่ม "ทดสอบเสียงเตือน" ใกล้ Debug
 - เพิ่มระดับเสียง beep ให้ชัดขึ้น
-
-
-## v25 Ripeness AI
-- แยกโมเดลระดับสุกออกมาเป็น Ripeness-only AI classifier
-- เทรนจากข้อมูล field-test 210 ตัวอย่าง
-- ใช้ acoustic features เป็นหลัก: centroid, band energy, peak count, rolloff, peak2 ratio
-- คาดว่า CV accuracy ~73% เทียบกับ current app ~52.6%
-
-## v25.1 Stable
-- แก้ปัญหา v25 ประมวลผลไม่ขึ้น/AI Voice ไม่ทำงาน
-- ใส่ fallback ให้ทุก feature ของ Ripeness AI
-- เพิ่ม safeAnalyzeSession เพื่อไม่ให้ error ตัวเดียวทำให้แอปหยุดทั้งหมด
+\n\n## v25.2 v24 Audio Base + Ripeness AI\n- ใช้ระบบรับเสียง/จับ event/คำนวณ feature ของ v24.3 เป็นฐาน\n- ใส่ Ripeness AI v25 แบบ stable\n- ถ้าเสียงไม่นิ่ง fallback ไปใช้ rule v24\n
