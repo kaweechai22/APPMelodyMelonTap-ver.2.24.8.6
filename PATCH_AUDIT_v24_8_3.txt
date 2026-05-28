@@ -1,0 +1,35 @@
+PATCH_AUDIT_v24_8_3.txt
+
+ฐานไฟล์:
+- ใช้ MelodyMelonTap_v24_8_2_app_calibrated.zip เป็นฐาน
+- ไม่แก้โมเดลความหวาน/กรอบ/ฉ่ำ
+- คง threshold ความสุก v24.8.2 ไว้
+- เพิ่มเฉพาะระบบจับเสียงเคาะจริงให้เสถียรขึ้น
+
+สิ่งที่เพิ่ม:
+1) KNOCK_TRIGGER_V2483
+2) RMS envelope detection
+3) Dynamic threshold จาก noise floor + p90
+4) Cooldown/refractory period 380 ms
+5) เลือก main impact จาก RMS สูงสุด
+6) Crop segment รอบ main impact: pre-roll 80 ms + post-roll 420 ms
+7) Debug: knock_count, threshold, noiseFloor, acceptedTimes
+
+จุดประสงค์:
+- แก้ปัญหาเคาะ 1 ครั้ง แต่แอปจับเป็น 2 ครั้ง
+- ลด echo/rebound/decay ที่ทำให้ peak_count/hollow_index/flatness สูงปลอม
+- ทำให้ input ก่อนเข้า classifier สะอาดขึ้น
+
+คำแนะนำทดลอง:
+- เคาะ 1 ครั้ง ควรเห็น knock_count ประมาณ 1
+- ถ้าเคาะ 3 ครั้งห่างกันมากกว่า 0.4 วินาที ควรเห็น knock_count ประมาณ 3
+- ถ้า knock_count ยังสูงเกิน ให้เพิ่ม cooldownMs จาก 380 เป็น 450
+- ถ้าจับไม่ติด ให้ลด thresholdMultiplier จาก 4.2 เป็น 3.5
+
+
+PATCH FIX:
+- รอบแรกเพิ่มฟังก์ชัน trigger แต่ยังไม่ได้เชื่อมกับ live loop ของ v24.7.1-base
+- รอบนี้เชื่อมจริงโดยแทน function loop()
+- เปลี่ยน cooldown จาก cooldownFrames=8 เป็น time-based cooldown 380 ms
+- เปลี่ยน onset จาก noiseFloor*3 เป็น dynamicThreshold = max(0.012, noiseFloor*4.2)
+- ลด eventFrames จาก 18 เหลือ 14 เพื่อลด decay/echo หลัง main impact

@@ -120,6 +120,169 @@
 </div>
 
 <script>
+let lastKnockTimeV2483 = -Infinity;
+
+/* ===== v24.8.4 Stable Knock Trigger =====
+   เป้าหมาย: ป้องกันเคาะ 1 ครั้ง แต่นับเป็น 2 ครั้ง จาก echo/rebound/decay
+   หลักการ:
+   - ใช้ RMS envelope หา hit จริง
+   - dynamic threshold จาก noise floor
+   - cooldown/refractory period 380 ms
+   - ignore secondary peaks ที่ตามหลัง main impact
+*/
+const KNOCK_TRIGGER_V2483 = {
+  cooldownMs: 380,
+  minPeakGapMs: 380,
+  preRollMs: 80,
+  postRollMs: 420,
+  rmsWindowMs: 18,
+  rmsHopMs: 6,
+  thresholdMultiplier: 4.2,
+  minAbsoluteRms: 0.012,
+  secondaryPeakRatio: 0.55
+};
+
+function medianV2483(arr){
+  if(!arr || !arr.length) return 0;
+  const a = Array.from(arr).sort((x,y)=>x-y);
+  const mid = Math.floor(a.length/2);
+  return a.length % 2 ? a[mid] : (a[mid-1] + a[mid]) / 2;
+}
+
+function percentileV2483(arr, p){
+  if(!arr || !arr.length) return 0;
+  const a = Array.from(arr).sort((x,y)=>x-y);
+  const idx = Math.max(0, Math.min(a.length-1, Math.floor((p/100) * (a.length-1))));
+  return a[idx];
+}
+
+function buildRmsEnvelopeV2483(samples, sr){
+  const win = Math.max(64, Math.floor(sr * KNOCK_TRIGGER_V2483.rmsWindowMs / 1000));
+  const hop = Math.max(16, Math.floor(sr * KNOCK_TRIGGER_V2483.rmsHopMs / 1000));
+  const env = [];
+  for(let s=0; s+win<samples.length; s+=hop){
+    let sum = 0;
+    for(let i=s; i<s+win; i++){
+      const v = samples[i] || 0;
+      sum += v*v;
+    }
+    env.push({
+      t: s / sr,
+      sampleIndex: s,
+      rms: Math.sqrt(sum / win)
+    });
+  }
+  return env;
+}
+
+function detectRealKnocksV2483(samples, sr){
+  const env = buildRmsEnvelopeV2483(samples, sr);
+  if(!env.length) return [];
+
+  const rmsValues = env.map(x => x.rms);
+  const noiseFloor = medianV2483(rmsValues.slice(0, Math.max(8, Math.floor(rmsValues.length * 0.35))));
+  const p90 = percentileV2483(rmsValues, 90);
+  const dynamicThreshold = Math.max(
+    KNOCK_TRIGGER_V2483.minAbsoluteRms,
+    noiseFloor * KNOCK_TRIGGER_V2483.thresholdMultiplier,
+    p90 * 0.42
+  );
+
+  const candidates = [];
+  for(let i=1; i<env.length-1; i++){
+    const prev = env[i-1].rms;
+    const cur = env[i].rms;
+    const next = env[i+1].rms;
+
+    // local maximum + above dynamic threshold
+    if(cur >= dynamicThreshold && cur >= prev && cur > next){
+      candidates.push(env[i]);
+    }
+  }
+
+  // Sort by time, apply refractory/cooldown.
+  // ถ้ามี peak ตามหลังเร็วเกินไป ให้ถือว่าเป็น echo/rebound ไม่ใช่เคาะใหม่
+  const accepted = [];
+  let lastAcceptedT = -Infinity;
+  let lastAcceptedRms = 0;
+
+  for(const c of candidates){
+    const dtMs = (c.t - lastAcceptedT) * 1000;
+    if(dtMs < KNOCK_TRIGGER_V2483.cooldownMs){
+      // ถ้าอยู่ใน cooldown และไม่แรงกว่ามาก ให้ ignore
+      if(c.rms < lastAcceptedRms * 1.35){
+        continue;
+      }
+      // ถ้าแรงกว่ามากจริง ๆ ก็แทน peak เดิมในช่วงเดียวกัน
+      if(accepted.length && c.rms > lastAcceptedRms){
+        accepted[accepted.length - 1] = c;
+        lastAcceptedT = c.t;
+        lastAcceptedRms = c.rms;
+      }
+      continue;
+    }
+
+    accepted.push(c);
+    lastAcceptedT = c.t;
+    lastAcceptedRms = c.rms;
+  }
+
+  return accepted.map(k => ({
+    ...k,
+    threshold: dynamicThreshold,
+    noiseFloor
+  }));
+}
+
+function extractBestKnockSegmentV2483(samples, sr){
+  const knocks = detectRealKnocksV2483(samples, sr);
+
+  if(!knocks.length){
+    // fallback: ใช้ช่วงพลังงานสูงสุดแบบเดิม แต่ยัง crop ให้สั้นพอ
+    const segLen = Math.min(samples.length, Math.floor(sr * 0.45));
+    const hop = Math.max(512, Math.floor(segLen / 8));
+    let bestStart = 0, bestEnergy = -1;
+    for(let s=0; s+segLen<samples.length; s+=hop){
+      let e = 0;
+      for(let i=s; i<s+segLen; i++) e += samples[i]*samples[i];
+      if(e > bestEnergy){
+        bestEnergy = e;
+        bestStart = s;
+      }
+    }
+    return {
+      segment: samples.slice(bestStart, bestStart + segLen),
+      knockCount: 0,
+      triggerDebug: {
+        mode: "fallback_energy",
+        noiseFloor: 0,
+        threshold: 0,
+        acceptedTimes: []
+      }
+    };
+  }
+
+  // เลือก knock ที่ RMS สูงสุดเป็นตัวแทนวิเคราะห์
+  const main = knocks.reduce((a,b) => b.rms > a.rms ? b : a, knocks[0]);
+  const pre = Math.floor(sr * KNOCK_TRIGGER_V2483.preRollMs / 1000);
+  const post = Math.floor(sr * KNOCK_TRIGGER_V2483.postRollMs / 1000);
+  const start = Math.max(0, main.sampleIndex - pre);
+  const end = Math.min(samples.length, main.sampleIndex + post);
+
+  return {
+    segment: samples.slice(start, end),
+    knockCount: knocks.length,
+    triggerDebug: {
+      mode: "stable_trigger_v24.8.4",
+      noiseFloor: main.noiseFloor,
+      threshold: main.threshold,
+      acceptedTimes: knocks.map(k => Number(k.t.toFixed(3))),
+      mainTime: Number(main.t.toFixed(3))
+    }
+  };
+}
+
+
 const NUM_TAPS = 5;
 const F_MIN = 50, F_MAX = 1000;
 let audioContext=null, mediaStream=null, analyser=null, freqData=null, timeData=null, rafId=null;
@@ -368,45 +531,85 @@ function estimateNoiseFloor(n){
   if(n>0)requestAnimationFrame(()=>estimateNoiseFloor(n-1));else{setStatus(`พร้อมเคาะ (${tapFeatures.length+1}/${NUM_TAPS})`);loop();}
 }
 function loop(){
-  if(!listening)return;
+  if(!listening) return;
+
   analyser.getFloatTimeDomainData(timeData);
-  const rms=getRMS(timeData), onset=rms>Math.max(0.018,noiseFloor*3);
-  if(cooldownFrames>0){cooldownFrames--;rafId=requestAnimationFrame(loop);return;}
-  if(captureState==="idle"&&onset){captureState="capturing";eventFrames=[];setStatus(`ตรวจพบการเคาะครั้งที่ ${tapFeatures.length+1}`);}
-  if(captureState==="capturing"){
-    analyser.getFloatTimeDomainData(timeData);analyser.getFloatFrequencyData(freqData);
-    eventFrames.push({time:Array.from(timeData),freq:Array.from(freqData)});
-    if(eventFrames.length>=18){
-      const feat=extractFeaturesFromEvent(eventFrames);
-      if(feat){tapFeatures.push(feat);updateTapProgress();}
-      else{setStatus("เสียงไม่ชัด กรุณาเคาะใหม่");setSignalQuality("สัญญาณอ่อน","bad");}
-      if(tapFeatures.length>=NUM_TAPS){listening=false;analyzeSession();
-function shareResult(){
-  const text =
-    document.getElementById("result").innerText +
-    "\nMelon Score: " + document.getElementById("melonScore").innerText +
-    "\nคำแนะนำ: " + document.getElementById("buyBadge").innerText +
-    "\n" + document.getElementById("signalBadge").innerText;
 
-  // ดาวน์โหลด CSV ข้อมูลดิบทั้งหมดพร้อมกัน
-  const exported = downloadMeasurementsCSV(false);
+  const rms = getRMS(timeData);
+  const now = performance.now();
 
-  if(navigator.share){
-    navigator.share({
-      title:"ผลวัดแตงโม MelodyMelonTap",
-      text: text + (exported ? "\n\nไฟล์ CSV ข้อมูลดิบถูกดาวน์โหลดไว้แล้ว" : "")
-    }).catch(()=>{});
-  }else{
-    alert(text + (exported ? "\n\nดาวน์โหลด CSV แล้ว" : "\n\nยังไม่มีข้อมูล CSV"));
+  // v24.8.4 dynamic noise tracking เฉพาะตอนยังไม่จับ event
+  if(captureState === "idle"){
+    noiseFloor = 0.97 * noiseFloor + 0.03 * rms;
   }
-}
 
-document.getElementById("startBtn").disabled=false;return;}
-      captureState="idle";eventFrames=[];cooldownFrames=8;
-      if(tapFeatures.length<NUM_TAPS)setStatus(`สำเร็จ ${tapFeatures.length}/${NUM_TAPS} ครั้ง กรุณาเคาะอีกครั้ง`);
+  const dynamicThreshold = Math.max(
+    KNOCK_TRIGGER_V2483.minAbsoluteRms,
+    noiseFloor * KNOCK_TRIGGER_V2483.thresholdMultiplier
+  );
+
+  const onset = rms > dynamicThreshold;
+  const inCooldown = (now - lastKnockTimeV2483) < KNOCK_TRIGGER_V2483.cooldownMs;
+
+  if(captureState === "idle"){
+    if(onset && !inCooldown){
+      lastKnockTimeV2483 = now;
+      captureState = "capturing";
+      eventFrames = [];
+      window.triggerDebugV2483 = {
+        mode: "live_stable_trigger_v24.8.4",
+        noiseFloor,
+        threshold: dynamicThreshold,
+        firstRms: rms,
+        acceptedTime: Number((now/1000).toFixed(3))
+      };
+      setStatus(`ตรวจพบการเคาะจริงครั้งที่ ${tapFeatures.length+1}`);
+    }else{
+      rafId = requestAnimationFrame(loop);
+      return;
     }
   }
-  rafId=requestAnimationFrame(loop);
+
+  if(captureState === "capturing"){
+    analyser.getFloatTimeDomainData(timeData);
+    analyser.getFloatFrequencyData(freqData);
+
+    eventFrames.push({
+      time: Array.from(timeData),
+      freq: Array.from(freqData),
+      rms
+    });
+
+    // เก็บสั้นลงเพื่อเน้น main impact ไม่ลาก echo/decay ยาวเกิน
+    if(eventFrames.length >= 14){
+      const feat = extractFeaturesFromEvent(eventFrames);
+
+      if(feat){
+        feat.triggerMode = "live_stable_trigger_v24.8.4";
+        feat.triggerThreshold = dynamicThreshold;
+        feat.triggerNoiseFloor = noiseFloor;
+        feat.triggerRms = rms;
+        tapFeatures.push(feat);
+        updateTapProgress();
+      }else{
+        setStatus("เสียงไม่ชัด กรุณาเคาะใหม่");
+        setSignalQuality("สัญญาณอ่อน","bad");
+      }
+
+      if(tapFeatures.length >= NUM_TAPS){
+        listening = false;
+        analyzeSession();
+        document.getElementById("startBtn").disabled = false;
+        return;
+      }
+
+      captureState = "idle";
+      eventFrames = [];
+      setStatus(`สำเร็จ ${tapFeatures.length}/${NUM_TAPS} ครั้ง กรุณาเคาะอีกครั้ง`);
+    }
+  }
+
+  rafId = requestAnimationFrame(loop);
 }
 
 function extractFeaturesFromEvent(frames){
@@ -598,11 +801,10 @@ function calibrateJuiceFieldV227(rawJuice, Q, fMean, fStd, hollowIndex, lowRatio
 
 
 function classifyRipenessV248_TEST9(lowRatio, highRatio, brix, firmness, juice, hollowPercent, fMean, fPeak, fStd, hollowIndex, flatness, rolloff85, peakCount){
-  // v24.8.2 App-Calibrated Patch
-  // ใช้ฐาน v24.8 ที่ patch จาก v24.7.1 เดิม แต่ปรับเฉพาะการจำแนกระดับความสุก
-  // เหตุผล: ข้อมูลแอปจริงพบว่า false "สุกเกิน" มากเกินไป จึงลด hollow override และคุมช่วง C ให้ปลอดภัยขึ้น
-  // ช่วง f_mean ใหม่จากข้อมูลแอปจริง:
-  // A < 430, B = 430–490, C = 490–545, D > 545
+  // v24.8.4 Ripe-Protection Patch
+  // แก้ปัญหา: ลูกสุกพอดีถูกทำนายเป็น "สุกเกิน" มากเกินไป
+  // หลักใหม่: ให้ "สุกเกิน/A" ออกเฉพาะเมื่อสัญญาณชัดมากเท่านั้น
+  // ไม่ใช้ hollow_index หรือ flatness ดึงเป็น A แบบง่าย ๆ อีกต่อไป
 
   const fm = safe(fMean, 0);
   const fp = safe(fPeak, 0);
@@ -611,43 +813,64 @@ function classifyRipenessV248_TEST9(lowRatio, highRatio, brix, firmness, juice, 
   const fl = safe(flatness, 0);
   const pc = safe(peakCount, 0);
 
-  const harmonicFlag = (fp > 700 && fm < 620) || (fp > 1.75 * fm && fm < 560);
-  const useF = harmonicFlag ? Math.min(fm, fp / 2) : fm;
+  const harmonicFlag = (fp > 700 && fm < 620) || (fp > 1.85 * fm && fm < 540);
 
+  // v24.8.4: ใช้ f_mean จริงเป็นแกนหลักก่อน
+  // ไม่ใช้ f_peak/2 เป็นตัวลากลง A เพราะทำให้สุกพอดีโดนทายสุกเกินได้
   let group;
-  if(useF < 430) group = "A";       // สุกเกิน
-  else if(useF < 490) group = "B";  // สุกจัด
-  else if(useF < 545) group = "C";  // สุกพอดี
-  else group = "D";                 // ใกล้สุก
+  if(fm < 405) group = "A";        // สุกเกิน: ต้องต่ำจริง
+  else if(fm < 485) group = "B";   // สุกจัด
+  else if(fm < 555) group = "C";   // สุกพอดี
+  else group = "D";                // ใกล้สุก
 
-  // C protection: ป้องกันลูกสุกพอดีโดนลากเป็นสุกเกิน
-  // ใช้หลัง base threshold เพื่อให้ช่วง 490–545 ยังรักษา C ไว้
-  const ripeProtection = (fm >= 490 && fm <= 545 && hi < 0.68);
-  if(ripeProtection){
+  // C protection แบบแข็ง: ช่วงสุกพอดีของข้อมูลแอปจริง
+  // ถ้าอยู่ช่วงนี้ ห้ามดึงเป็น A ยกเว้นมีสัญญาณสุกเกินรุนแรงมากจริง ๆ
+  const veryStrongOverripe =
+    fm < 405 &&
+    hi > 0.74 &&
+    fs > 210 &&
+    (fl > 0.90 || pc >= 14);
+
+  const ripeProtection =
+    fm >= 470 &&
+    fm <= 565 &&
+    hi < 0.78;
+
+  if(ripeProtection && !veryStrongOverripe){
     group = "C";
   }
 
-  // D protection: ป้องกันใกล้สุกโดนลากลงเป็น B/A
-  if(fm >= 545 && hi < 0.52){
+  // D protection: ใกล้สุกยังต้องรักษาไว้
+  if(fm >= 555 && hi < 0.58){
     group = "D";
   }
 
-  // Strong overripe only: ลด false A
-  // ไม่ใช้ hollow_index เดี่ยว ๆ แล้ว ต้องมี f_mean ต่ำ + hollow สูง + spread สูง
-  const strongOverripeSignal = (fm < 430 && hi > 0.65 && fs > 170);
-  if(strongOverripeSignal){
+  // ลด false A: ถ้าเดิมเป็น A แต่ hollow/spread ไม่แรงพอ ให้ขยับขึ้นเป็น B
+  if(group === "A" && !veryStrongOverripe){
+    if(fm >= 385 || hi < 0.70 || fs < 190){
+      group = "B";
+    }
+  }
+
+  // Strong overripe only: ใช้เฉพาะเคสชัดมาก
+  if(veryStrongOverripe){
     group = "A";
   }
 
-  // Weak flatness tie-break เท่านั้น เพราะ TEST9 พบว่า flatness overlap หนัก
-  if(group === "C" && fl > 0.92 && fm < 470 && (hi >= 0.60 || fs >= 190 || pc >= 12)){
+  // Flatness เป็นแค่ตัวช่วยเล็กมาก ไม่ดึง C เป็น A
+  if(group === "C" && fl > 0.94 && fm < 470 && hi > 0.72 && fs > 210){
     group = "B";
   }
 
-  // Harmonic guard: ไม่ให้ f_peak สูงลากไป D/E
-  // ถ้า corrected frequency ต่ำกว่า 490 และเดิมตก C ให้ดึงลงเป็น B เท่านั้น ไม่ดึงแรงถึง A
-  if(harmonicFlag && useF < 490 && group === "C"){
-    group = "B";
+  // Harmonic guard: ใช้เพื่อกัน D ปลอมเท่านั้น ไม่ดึงลงถึง A
+  if(harmonicFlag){
+    const corrected = Math.min(fm, fp / 2);
+    if(group === "D" && corrected < 500 && hi >= 0.60){
+      group = "C";
+    }
+    if(group === "C" && corrected < 455 && hi >= 0.72 && fs > 200){
+      group = "B";
+    }
   }
 
   return group;
@@ -663,29 +886,26 @@ function getRipenessExtraNoteV248(fMean, group, hollowPercent, firmness, lowRati
   const low = safe(lowRatio, 0);
   const notes = [];
 
-  if((fp > 700 && fm < 620) || (fp > 1.75 * fm && fm < 560)){
-    notes.push("harmonic_guard: พบ f_peak สูงผิดปกติ จึงใช้ f_mean/f_peak÷2 ช่วยกัน ไม่ให้ peak หลอกผล");
+  if((fp > 700 && fm < 620) || (fp > 1.85 * fm && fm < 540)){
+    notes.push("harmonic_guard: พบ f_peak สูงผิดปกติ แต่ v24.8.4 ไม่ใช้ peak/2 ดึงผลลงเป็นสุกเกินโดยตรง");
   }
-  if(group === "C" && fm >= 490 && fm <= 545 && hi < 0.68){
-    notes.push("C_protection: อยู่ในช่วงสุกพอดีของข้อมูลแอปจริง จึงป้องกันไม่ให้ถูกลากเป็นสุกเกิน");
+  if(group === "C" && fm >= 470 && fm <= 565 && hi < 0.78){
+    notes.push("C_protection: ล็อกช่วงสุกพอดีเพื่อกัน false สุกเกิน");
   }
-  if(group === "D" && fm >= 545 && hi < 0.52){
+  if(group === "D" && fm >= 555 && hi < 0.58){
     notes.push("D_protection: f_mean สูงและ hollow_index ไม่สูง จึงคงผลเป็นใกล้สุก");
   }
-  if(group === "A" && fm < 430 && hi > 0.65){
-    notes.push("strong_overripe_signal: f_mean ต่ำร่วมกับ hollow_index สูง จึงจัดเป็นสุกเกิน");
+  if(group === "A"){
+    notes.push("very_strong_overripe: สุกเกินจะออกเฉพาะเมื่อ f_mean ต่ำมาก + hollow/spread สูงมาก");
   }
-  if(group === "B" && fm >= 430 && fm < 490){
-    notes.push("B_range: อยู่ในช่วงสุกจัดของ threshold v24.8.2");
+  if(group === "B" && fm < 485){
+    notes.push("B_range: จัดเป็นสุกจัด/เริ่มสุกมาก แต่ยังไม่ฟันธงสุกเกินถ้าสัญญาณไม่แรงพอ");
   }
-  if(group === "D" && fm > 650){
-    notes.push("มีแนวโน้มยังดิบมาก");
+  if(fl > 0.94 && pc >= 14){
+    notes.push("flatness/peak_count สูง แต่ใช้เป็นตัวช่วยเท่านั้น ไม่ใช้ฟันธงสุกเกินเดี่ยว ๆ");
   }
   if(group === "A" && (h >= 18 || firm <= 9 || low > 0.40)){
-    notes.push("คำเตือน: มีแนวโน้มสุกเกินหรือมีโพรงภายใน ควรตรวจซ้ำหรือผ่าดูประกอบ");
-  }
-  if(fl > 0.92 && pc >= 12){
-    notes.push("flatness สูง แต่ v24.8.2 ใช้เป็นเพียงตัวช่วย ไม่ใช้ฟันธงเดี่ยว ๆ");
+    notes.push("คำเตือน: ควรตรวจซ้ำหรือผ่าดูประกอบ เพราะมีแนวโน้มโพรง/เนื้อหลวม");
   }
 
   return notes.join(" | ");
@@ -793,7 +1013,7 @@ function analyzeSession(){
   document.getElementById("confVal").innerText=`${conf.toFixed(0)} %`;document.getElementById("groupVal").innerText=`ช่วงสุก: ${group}`;
   setBar("brixBar",brix/14*100);setBar("firmBar",crispPct);setBar("juiceBar",juice);setBar("hollowBar",100-hollowPercent*2.5);setBar("confBar",conf);
   document.getElementById("featureList").innerHTML=`
-    <li>Q: ${Quse.toFixed(2)}</li><li>tau: ${tauUsed.toFixed(3)}</li><li>f_peak: ${avg.fPeak.toFixed(1)} Hz</li><li>f_mean: ${fMeanUse.toFixed(1)} Hz <b>(ใช้จำแนกระดับการสุก)</b></li><li>ripeness_extra_note: ${ripenessExtraNoteV248 || "-"}</li><li>f_std: ${fStdUse.toFixed(1)} Hz</li><li>f_variance: ${fVarUse.toFixed(1)}</li><li>hollow_index: ${hollowIndexUse.toFixed(3)}</li><li>Brix raw: ${brixRaw.toFixed(2)} °Bx → calibrated: ${brix.toFixed(2)} °Bx</li><li>Firmness raw model: ${firmnessRaw.toFixed(1)} N → calibrated: ${firmness.toFixed(1)} N</li><li>Juice raw: ${juiceRaw.toFixed(1)}% → calibrated: ${juice.toFixed(1)}%</li><li>Hollow raw: ${hollowRawPercent.toFixed(1)}% → v22.5: ${hollowPercentOriginal.toFixed(1)}% → v22.6: ${hollowPercent.toFixed(1)}%</li><li>high_ratio: ${highRatioUse.toFixed(3)}</li><li>low_ratio: ${lowRatioUse.toFixed(3)}</li><li>flatness: ${flatnessUse.toFixed(3)}</li><li>rolloff85: ${rolloff85Use.toFixed(1)} Hz</li><li>peak count: ${peakCountUse.toFixed(0)}</li><li>low_ratio: ${avg.lowRatio.toFixed(3)}</li><li>flatness: ${avg.flatness.toFixed(3)}</li><li>Audio120 ripeness label: ${ripenessLabel120}</li><li>Final ripeness group: ${group} (v24.8.2 app-calibrated rule)</li><li>Perfect ripe meter: ${ripeMeter.toFixed(0)}/100</li><li>คุณภาพสัญญาณ: ${sigLabel} (${sigScore.toFixed(0)}%)</li><li>Q spread: ${qSpread.toFixed(2)}</li><li>tau fallback: ${tauFallbackCount}/${NUM_TAPS}</li><li>สถานะผล: ${warnLowQuality ? "ใช้ได้แต่ควรวัดซ้ำเพื่อยืนยัน" : "ใช้ได้"}</li>`;
+    <li>Q: ${Quse.toFixed(2)}</li><li>tau: ${tauUsed.toFixed(3)}</li><li>f_peak: ${avg.fPeak.toFixed(1)} Hz</li><li>f_mean: ${fMeanUse.toFixed(1)} Hz <b>(ใช้จำแนกระดับการสุก)</b></li><li>ripeness_extra_note: ${ripenessExtraNoteV248 || "-"}</li><li>f_std: ${fStdUse.toFixed(1)} Hz</li><li>f_variance: ${fVarUse.toFixed(1)}</li><li>hollow_index: ${hollowIndexUse.toFixed(3)}</li><li>Brix raw: ${brixRaw.toFixed(2)} °Bx → calibrated: ${brix.toFixed(2)} °Bx</li><li>Firmness raw model: ${firmnessRaw.toFixed(1)} N → calibrated: ${firmness.toFixed(1)} N</li><li>Juice raw: ${juiceRaw.toFixed(1)}% → calibrated: ${juice.toFixed(1)}%</li><li>Hollow raw: ${hollowRawPercent.toFixed(1)}% → v22.5: ${hollowPercentOriginal.toFixed(1)}% → v22.6: ${hollowPercent.toFixed(1)}%</li><li>high_ratio: ${highRatioUse.toFixed(3)}</li><li>low_ratio: ${lowRatioUse.toFixed(3)}</li><li>flatness: ${flatnessUse.toFixed(3)}</li><li>rolloff85: ${rolloff85Use.toFixed(1)} Hz</li><li>peak count: ${peakCountUse.toFixed(0)}</li><li>low_ratio: ${avg.lowRatio.toFixed(3)}</li><li>flatness: ${avg.flatness.toFixed(3)}</li><li>Audio120 ripeness label: ${ripenessLabel120}</li><li>Final ripeness group: ${group} (v24.8.4 ripe-protection rule)</li><li>Perfect ripe meter: ${ripeMeter.toFixed(0)}/100</li><li>คุณภาพสัญญาณ: ${sigLabel} (${sigScore.toFixed(0)}%)</li><li>Q spread: ${qSpread.toFixed(2)}</li><li>tau fallback: ${tauFallbackCount}/${NUM_TAPS}</li><li>สถานะผล: ${warnLowQuality ? "ใช้ได้แต่ควรวัดซ้ำเพื่อยืนยัน" : "ใช้ได้"}</li>`;
   saveHistory(ripe.label,brix,conf,melonScore,buyText,sigScore);
   speakSummaryAI({ripenessText:(ripenessExtraText || (group==="C" ? "แตงโมลูกนี้อยู่ในช่วงสุกพอดี" : ((group==="A"||group==="B") ? "แตงโมลูกนี้มีแนวโน้มสุกเกิน" : "แตงโมลูกนี้ใกล้สุก"))), sweetnessText:sweetnessLabel(brix), crispText, juiceText:juiceLabel(juice), hollowText, qualityText, hollowPercent});
   
@@ -1070,6 +1290,14 @@ document.getElementById("resetBtn").addEventListener("click",resetAll);
 document.getElementById("shareBtn").addEventListener("click",shareResult);
 if("serviceWorker" in navigator){navigator.serviceWorker.register("sw.js").catch(()=>{});}
 updateHistory();updateWatermelonColor("#ff5252");
+
+function getTriggerDebugTextV2483(features){
+  if(!features || !features.trigger_debug) return "";
+  const d = features.trigger_debug;
+  const times = (d.acceptedTimes || []).join(", ");
+  return `Trigger v24.8.4: ${d.mode || "-"} | เคาะจริงที่รับ: ${features.knock_count ?? "-"} | threshold=${Number(d.threshold||0).toFixed(4)} | noise=${Number(d.noiseFloor||0).toFixed(4)} | times=[${times}]`;
+}
+
 </script>
 </body>
 </html>
